@@ -1,0 +1,7 @@
+{
+  "name": "codex-agents",
+  "version": "0.3.0",
+  "description": "OpenAI Codex as Claude Code subagents: a codex subagent type answered by Codex, a live panel of Codex runs, and the usage guidance built in",
+  "author": { "name": "BarqDev" },
+  "types": "./types/index.d.ts"
+}

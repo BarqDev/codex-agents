@@ -1,0 +1,147 @@
+#!/bin/bash
+# codex-agent: drive the OpenAI Codex CLI as a cheap subagent for Claude Code.
+#
+#   codex-agent model [TIER]          print the auto-detected model for a tier (default: sol)
+#   codex-agent models                list all models (slug, priority, visibility)
+#   codex-agent limits                show the latest Codex weekly usage snapshot
+#   codex-agent run [opts] "prompt"   run one task, print the final answer to stdout
+#   codex-agent watch [NAME]          live view of every running agent (run it in a terminal tab)
+#   codex-agent ps                    list recent runs with state and latest step
+#   codex-agent doctor                check the Codex CLI, login, model list and tiers
+#
+# run options:
+#   -n NAME       label shown in watch/ps (default: first words of the prompt)
+#   -v            also print live progress to stderr
+#   -w            allow writes in the working dir (workspace-write sandbox); default read-only
+#   -x            full access: no sandbox, network on (browser QA, deploy checks); use only when needed
+#   -C DIR        working directory for the task (default: current dir)
+#   -e EFFORT     low|medium|high|xhigh|max (default: medium; never "ultra", it self-delegates)
+#   -t TIER       sol (default, top non-Astra workhorse), terra (mid tier, like Sonnet), luna (fast/cheap);
+#                 picks the newest listed model of that family
+#   -m MODEL      override the auto-detected model (wins over -t)
+#   -o FILE       also write the final answer to FILE
+#   -             read the prompt from stdin
+#
+# Each run keeps meta.json, status.json, progress.log, events.jsonl and last.txt in
+# ~/.claude/cache/codex-runs/<id>/ (pruned after 7 days).
+# Env overrides: CODEX_BIN, CODEX_AGENT_MODEL, CODEX_AGENT_TIER, CODEX_AGENT_EFFORT.
+set -euo pipefail
+
+CACHE="$HOME/.codex/models_cache.json"
+CATALOG="$HOME/.claude/cache/codex-catalog.json"
+RUNS="$HOME/.claude/cache/codex-runs"
+LIVE="$(dirname "$0")/codex-agent-live.py"
+# Python lives in files, never heredocs: bash writes a heredoc to a temp file, which a read-only
+# sandbox refuses. -I keeps it from reading or writing anything beside the script.
+MODELS="$(dirname "$0")/codex-agent-models.py"
+
+find_bin() {
+  if [[ -n "${CODEX_BIN:-}" ]]; then
+    [[ -x "$CODEX_BIN" ]] || { echo "codex-agent: CODEX_BIN is not an executable: $CODEX_BIN" >&2; exit 127; }
+    echo "$CODEX_BIN"; return
+  fi
+  # The ChatGPT/Codex desktop app ships a current CLI; Homebrew's copy is often stale.
+  for c in /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex \
+           /Applications/Codex.app/Contents/Resources/codex-cli/bin/codex \
+           "$(command -v codex 2>/dev/null || true)"; do
+    [[ -x "$c" ]] || continue
+    v=$("$c" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    # exec needs a modern CLI (0.100+); 0.9.x has no model catalog or --ephemeral
+    if [[ -n "$v" && "${v%%.*}" -eq 0 && "${v#*.}" -lt 100 ]]; then continue; fi
+    echo "$c"; return
+  done
+  echo "codex-agent: no usable Codex CLI found (install the ChatGPT/Codex app or set CODEX_BIN)" >&2
+  exit 127
+}
+
+# A tier resolves to the newest listed model of its family (see codex-agent-models.py).
+detect_model() {
+  local tier="${1:-${CODEX_AGENT_TIER:-sol}}"
+  if [[ -n "${CODEX_AGENT_MODEL:-}" ]]; then echo "$CODEX_AGENT_MODEL"; return; fi
+  python3 -I "$MODELS" model "$CACHE" "$tier"
+}
+
+# A local catalog skips the network model refresh, which times out and adds ~30s per call.
+ensure_catalog() {
+  mkdir -p "$(dirname "$CATALOG")"
+  if [[ ! -f "$CATALOG" || "$CACHE" -nt "$CATALOG" ]]; then
+    python3 -c 'import json,sys; json.dump({"models": json.load(open(sys.argv[1]))["models"]}, open(sys.argv[2], "w"))' "$CACHE" "$CATALOG"
+  fi
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  model) detect_model "${1:-}" ;;
+  models) python3 -I "$MODELS" models "$CACHE" ;;
+  limits)
+    f=$(find "$HOME/.codex/sessions" -name '*.jsonl' -mtime -2 -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null | while read -r p; do grep -q '"rate_limits"' "$p" && { echo "$p"; break; }; done)
+    [[ -n "$f" ]] || { echo "no recent Codex session with rate-limit data; run any non-ephemeral codex task first"; exit 0; }
+    python3 -I "$MODELS" limits "$f"
+    ;;
+  doctor)
+    ok=1
+    if bin=$(find_bin 2>/dev/null); then
+      echo "✓ Codex CLI: $bin ($("$bin" --version 2>/dev/null | head -1))"
+      status=$("$bin" login status 2>&1 | head -1 || true)
+      case "$status" in
+        *"Logged in"*) echo "✓ $status" ;;
+        *) echo "✗ Not logged in to Codex ($status). Run: \"$bin\" login"; ok=0 ;;
+      esac
+    else
+      echo "✗ No Codex CLI found. Install the ChatGPT desktop app (it bundles Codex) or the Codex CLI 0.100+, or set CODEX_BIN."; ok=0
+    fi
+    if command -v python3 >/dev/null; then echo "✓ python3: $(command -v python3)"; else echo "✗ python3 is missing"; ok=0; fi
+    if [[ -f "$CACHE" ]]; then
+      echo "✓ Model list: $CACHE"
+      for t in sol terra luna; do
+        if m=$(detect_model "$t" 2>/dev/null); then echo "✓ Tier $t: $m"; else echo "! Tier $t: no listed model"; fi
+      done
+    else
+      echo "✗ No Codex model list yet ($CACHE). Open the Codex app, or run any codex command once."; ok=0
+    fi
+    if [[ $ok -eq 1 ]]; then echo "Ready: Codex subagents will work."; else echo "Not ready: fix the ✗ items above."; exit 1; fi
+    ;;
+  watch) exec python3 "$LIVE" watch "$@" ;;
+  ps) exec python3 "$LIVE" ps ;;
+  run)
+    sandbox=read-only; dir="$PWD"; effort="${CODEX_AGENT_EFFORT:-medium}"; model=""; tier=""; out=""; name=""; echo_flag=""
+    while getopts "wxvC:e:m:t:o:n:" opt; do
+      case $opt in
+        w) sandbox=workspace-write ;; x) sandbox=full ;; v) echo_flag=--echo ;; C) dir="$OPTARG" ;;
+        e) effort="$OPTARG" ;; m) model="$OPTARG" ;; t) tier="$OPTARG" ;; o) out="$OPTARG" ;; n) name="$OPTARG" ;;
+        *) exit 2 ;;
+      esac
+    done
+    shift $((OPTIND - 1))
+    [[ "$effort" == ultra ]] && effort=max
+    prompt="${1:-}"; [[ -z "$prompt" || "$prompt" == "-" ]] && prompt="$(cat)"
+    [[ -n "$name" ]] || name=$(printf '%s' "$prompt" | tr -cs 'A-Za-z0-9' ' ' | awk '{print tolower($1"-"$2"-"$3)}' | sed 's/-*$//')
+    bin=$(find_bin); [[ -n "$model" ]] || model=$(detect_model "$tier"); ensure_catalog
+    mkdir -p "$RUNS"; find "$RUNS" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+    run="$RUNS/$(date +%Y%m%d-%H%M%S)-$$-${name//[^A-Za-z0-9_-]/}"
+    mkdir -p "$run"
+    python3 -c 'import json,sys,time; json.dump({"name":sys.argv[1],"model":sys.argv[2],"effort":sys.argv[3],"sandbox":sys.argv[4],"dir":sys.argv[5],"pid":int(sys.argv[6]),"started":time.time()}, open(sys.argv[7],"w"))' \
+      "$name" "$model" "$effort" "$sandbox" "$dir" "$$" "$run/meta.json"
+    printf '%s' "$prompt" >"$run/prompt.txt"
+    echo '{"state":"running"}' >"$run/status.json"
+    if [[ "$sandbox" == full ]]; then access=(--dangerously-bypass-approvals-and-sandbox); else access=(-s "$sandbox"); fi
+    # First live line names the run's settings; the codex-agents plugin reads the model from it.
+    [[ -n "$echo_flag" ]] && echo "▶ $model · $effort · $sandbox" >&2
+    set +e
+    "$bin" exec -m "$model" -c "model_reasoning_effort=\"$effort\"" -c "model_catalog_json=\"$CATALOG\"" \
+      --ignore-user-config --skip-git-repo-check --ephemeral "${access[@]}" -C "$dir" --json \
+      -o "$run/last.txt" "$prompt" </dev/null 2>"$run/stderr.log" | tee "$run/events.jsonl" | python3 "$LIVE" fmt "$run" $echo_flag
+    rc=${PIPESTATUS[0]}
+    set -e
+    state=done; [[ $rc -eq 0 ]] || state=failed
+    python3 -c 'import json,sys,time; json.dump({"state":sys.argv[1],"rc":int(sys.argv[2]),"ended":time.time()}, open(sys.argv[3],"w"))' "$state" "$rc" "$run/status.json"
+    if [[ $rc -ne 0 ]]; then
+      echo "codex-agent: codex exited $rc (model=$model, run=$run). Log tail:" >&2
+      tail -15 "$run/progress.log" "$run/stderr.log" >&2 2>/dev/null
+      exit $rc
+    fi
+    [[ -n "$out" ]] && cp "$run/last.txt" "$out"
+    cat "$run/last.txt"
+    ;;
+  *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

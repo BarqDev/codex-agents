@@ -1,0 +1,5 @@
+{
+  "name": "barqdev-codex-agents",
+  "owner": { "name": "BarqDev" },
+  "plugins": [{ "name": "codex-agents", "source": "./" }]
+}
