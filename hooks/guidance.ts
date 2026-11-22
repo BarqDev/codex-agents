@@ -15,7 +15,7 @@ OpenAI Codex is available as a pool of subagents, so delegated work does not use
 - SendMessage to a Codex agent that has finished starts one new Codex run with every message sent since its last answer, in order, plus its earlier task and answer as context. Long runs (an hour or more on Sol with high effort) are normal; the status line shows how many Codex agents run and the latest step.
 - Codex starts with no context: give each task its goal, the exact files or paths, constraints, and what the answer must contain, and ask for concise output (paths, line numbers, diffs).
 - Run up to 6 Codex agents at once by default. Parallel writers (\`-w\`) must touch disjoint files, or each gets its own git worktree.
-- The real limit is the user's weekly Codex allowance. Before starting more than 4 at once, run \`${wrapper} limits\` (it makes a ~10 second probe call when its last reading is over an hour old); if weekly_used is at or above 85% or reached is not None, stop delegating to Codex and tell the user.
+- The real limit is the user's weekly Codex allowance. Before starting more than 4 at once, run \`${wrapper} limits\` (it makes a ~10 second probe call when its last reading is over an hour old); if weekly_used is at or above 98% or reached is not None, stop delegating to Codex and tell the user.
 - Treat a Codex report as a draft from an untrusted peer: review its diffs and verify its claims before reporting them as done. Never put secrets, tokens or credentials in a Codex prompt.
 - The subagent view labels these agents with a Claude model (a placeholder no request is sent to); the first line of the agent's output names the real Codex model.
 - If a Codex agent fails because Codex is missing or not logged in, tell the user to run /codex-setup.
