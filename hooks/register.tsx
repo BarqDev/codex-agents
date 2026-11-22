@@ -41,6 +41,9 @@ async function doctor($: EngineInterface): Promise<{ ok: boolean; text: string }
 export const register: Register = on => {
   registerCodexSubagent(on)
   registerGuidance(on)
+  // What the status line says when no agent runs (a setup problem), and what it says now.
+  let warning: string | undefined
+  let lastStatus: string | undefined
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -57,8 +60,12 @@ export const register: Register = on => {
     )
     // A quiet check per session: only a problem is shown, pointing at /codex-setup.
     void doctor($)
-      .then(r => r.ok || $.ui.status('codex-agents: Codex is not ready here. Run /codex-setup'))
-      .catch(() => $.ui.status('codex-agents: could not run the Codex check. Run /codex-setup'))
+      .then(r => {
+        if (!r.ok) warning = 'codex-agents: Codex is not ready here. Run /codex-setup'
+      })
+      .catch(() => {
+        warning = 'codex-agents: could not run the Codex check. Run /codex-setup'
+      })
 
     const home = (await $.env.get('HOME')) ?? ''
     const runsDir = `${home}/.claude/cache/codex-runs`
@@ -118,9 +125,23 @@ export const register: Register = on => {
           await update($, runs, () => shown)
         }
         if (shown.some(r => r.state === 'running')) await update($, now, () => t)
+
+        // A heartbeat on the status line while agents run, so long runs show signs of life in the
+        // chat too; otherwise the setup warning, if any.
+        const active = shown.filter(r => r.state === 'running')
+        const longest = active.reduce<RunView | undefined>((a, b) => (a && a.startedMs <= b.startedMs ? a : b), undefined)
+        const latest = (longest?.lines.at(-1) ?? '').replace(/^\d\d:\d\d:\d\d /, '').slice(0, 70)
+        const line = longest
+          ? `Codex: ${active.length} running · ${longest.name} ${elapsed(longest, t)}${latest ? ` · ${latest}` : ''}`
+          : warning
+        if (line !== lastStatus) {
+          lastStatus = line
+          $.ui.status(line)
+        }
       } catch (err) {
         // A refused or failed read skips this tick; the next one tries again.
-        $.ui.status(`codex-agents: ${String(err).slice(0, 120)}`)
+        lastStatus = `codex-agents: ${String(err).slice(0, 120)}`
+        $.ui.status(lastStatus)
       } finally {
         polling = false
       }
@@ -134,7 +155,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'codex-setup' }, async $ => {
     const r = await doctor($).catch(err => ({ ok: false, text: `Could not run the check: ${String(err)}` }))
-    if (r.ok) $.ui.status(undefined)
+    warning = r.ok ? undefined : 'codex-agents: Codex is not ready here. Run /codex-setup'
     return { text: r.text }
   })
 

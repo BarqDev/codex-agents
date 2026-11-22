@@ -53,12 +53,18 @@ Add this to the repo's `.claude/settings.json` and commit it. Claude Code then o
 Ask Claude to delegate ("have Codex agents check X and Y in parallel"), or let it choose. The guidance tells Claude to prefer Codex for delegable work.
 
 - **Tier:** the Agent call's `model` picks it: `sonnet` = Terra (mid tier, routine work), `haiku` = Luna (trivial lookups), omitted = Sol (strongest non-frontier model, hard work). Each tier resolves to the newest Codex model of that family, so new releases are picked up automatically. Astra is never auto-picked.
-- **Options:** an optional first prompt line, `codex: -t terra -w -e high -C /path`. `-w` lets it edit files in the working directory and `-x` gives full access with network; without either it is read-only.
+- **Options:** an optional first prompt line, `codex: -t terra -w -e high -C /path`. Without an access flag it is read-only.
+  - `-w` lets it edit files in the working directory, with no network (not even localhost).
+  - `-N` is `-w` plus network. Use it for test suites that need a local database or service. Codex's sandbox can't limit this to localhost, so it is full network.
+  - `-x` gives full access with network, for browser QA and the like.
+- **Changed files:** a run that may write ends its report with the working tree's `git status --short`, so lockfiles and generated files show up even when the report forgets them.
+- **Follow-ups:** SendMessage to a finished Codex agent starts one new Codex run with every message sent since its last answer, in order, plus the earlier task and answer as context.
+- **Seeing progress:** the subagent view streams each agent's steps; the Codex agents panel lists every run; the status line shows how many Codex agents are running and the latest step of the longest one.
 - **Model label:** the subagent view labels these agents with a Claude model (Haiku). That's a placeholder no request is sent to; the first line of the agent's output names the real Codex model.
 - **From a shell:** the plugin's `scripts/codex-agent` runs Codex directly (`run`, `watch`, `ps`, `limits`, `models`, `doctor`). Run it with no arguments for usage. Run logs are kept in `~/.claude/cache/codex-runs/` for 7 days.
 
 ## Limits
 
 - Codex's commands show as lines of text in the agent's view, not as separate tool-call rows.
-- A follow-up message to a Codex agent starts a fresh Codex run, with the earlier task included as context.
-- The usage limit that matters is your weekly Codex allowance. `codex-agent limits` shows it when Codex has saved a session log recently.
+- A follow-up starts a fresh Codex run: Codex gets the earlier task and answer as text, not its earlier working state.
+- The usage limit that matters is your weekly Codex allowance. `codex-agent limits` shows it; when its last reading is over an hour old it makes a tiny probe call (about 10 seconds) to get a fresh one.

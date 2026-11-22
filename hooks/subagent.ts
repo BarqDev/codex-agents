@@ -1,8 +1,8 @@
-import type { EngineInterface, On } from 'claude-code'
+import type { EngineInterface, On, SessionMessage } from 'claude-code'
 
-// A Claude subagent type whose every model turn is answered by OpenAI Codex (through
-// ~/.claude/scripts/codex-agent) instead of a Claude request: it shows in Claude's own
-// subagent view, streams Codex's steps live as thinking, and hands back Codex's answer.
+// A Claude subagent type whose every model turn is answered by OpenAI Codex (through the bundled
+// scripts/codex-agent) instead of a Claude request: it shows in Claude's own subagent view,
+// streams Codex's steps live, and hands back Codex's answer.
 export const AGENT = 'codex-agents:codex'
 
 const DESCRIPTION = [
@@ -13,8 +13,9 @@ const DESCRIPTION = [
   'goal, exact files or paths, constraints, and what the answer must contain.',
   'Read-only by default. Optional first line of the prompt: `codex: <flags>` with',
   '-t sol|terra|luna (model tier; default sol, terra when the Agent call passes model "sonnet", luna for "haiku"),',
-  '-w (may edit files in the working directory), -x (full access with network: browser QA, deploy checks),',
-  '-e low|medium|high (effort), -C <dir> (working directory).',
+  '-w (may edit files in the working directory), -N (with -w: network on, e.g. a local database for tests),',
+  '-x (full access with network: browser QA, deploy checks), -e low|medium|high (effort), -C <dir> (working directory).',
+  'SendMessage to it after it finished starts a new Codex run with every message sent since its last answer.',
 ].join(' ')
 
 // Never sent: every turn of this agent is answered by the turn.step hook below.
@@ -23,12 +24,12 @@ const SYSTEM_PROMPT = 'This agent is answered by OpenAI Codex through the codex-
 // A subagent delivers its final report to its caller by calling this tool with `{ message }`.
 const HANDBACK = 'SubagentHandback'
 
-const FLAG_WITH_VALUE = new Set(['-t', '-e', '-C', '-n'])
-const FLAG_ALONE = new Set(['-w', '-x'])
+// The first line of every Codex turn's text: it names the real model, and marks the agent as a
+// Codex one in its own transcript, so a turn is recognized even after a reload.
+const MARK = '**Codex** ·'
 
-// `reported` is the turn whose report was handed back, and `answer` that report: the turn's next
-// step ends it with the answer as its last text.
-type Run = { flags: string[]; task: string; name: string; turns: number; reported: string | null; answer: string }
+const FLAG_WITH_VALUE = new Set(['-t', '-e', '-C', '-n'])
+const FLAG_ALONE = new Set(['-w', '-x', '-N'])
 
 function parseHeader(prompt: string): { flags: string[]; body: string } {
   const m = prompt.match(/^\s*codex:([^\n]*)\n?/i)
@@ -74,8 +75,49 @@ export async function registerCodexAgentType($: EngineInterface) {
   })
 }
 
+const isHandback = (m: SessionMessage) => m.role === 'assistant' && m.toolUses.some(t => t.tool === HANDBACK)
+const handbackText = (m: SessionMessage) =>
+  String(m.toolUses.find(t => t.tool === HANDBACK)?.input?.message ?? '')
+// A message the caller sent (the task, or a SendMessage), not a tool result.
+const isFromCaller = (m: SessionMessage) => m.role === 'user' && !m.toolResults?.length && m.text.trim() !== ''
+
+// What this step has to do, read from the agent's own transcript so nothing lives in memory:
+// - `end`: the hand-back's result just came back; end the turn with the answer as its last text.
+// - `run`: run Codex on every message sent since the last answer (all of them on the first turn).
+type Plan = { kind: 'end'; answer: string } | { kind: 'run'; flags: string[]; task: string; first: string }
+
+export function plan(messages: SessionMessage[]): Plan | null {
+  const callers = messages.filter(isFromCaller)
+  const first = callers[0]
+  if (!first) return null
+  const last = messages.at(-1)
+  const lastHandback = [...messages].reverse().find(isHandback)
+  if (lastHandback && last?.role === 'user' && last.toolResults?.length && lastHandback === messages.at(-2))
+    return { kind: 'end', answer: handbackText(lastHandback) }
+
+  const { flags, body } = parseHeader(first.text)
+  if (!lastHandback) return { kind: 'run', flags, task: body, first: body }
+  const fresh = messages
+    .slice(messages.indexOf(lastHandback) + 1)
+    .filter(isFromCaller)
+    .map(m => m.text.trim())
+  if (fresh.length === 0) return null
+  const task = [
+    'You are continuing earlier work. The original task, for context:',
+    body.trim(),
+    'Your previous answer, for context:',
+    handbackText(lastHandback).slice(0, 6000),
+    fresh.length > 1 ? `New messages, in the order they were sent (${fresh.length}):` : 'New message:',
+    fresh.map((t, i) => (fresh.length > 1 ? `${i + 1}. ${t}` : t)).join('\n\n'),
+  ].join('\n\n')
+
+  return { kind: 'run', flags, task, first: body }
+}
+
 export function registerCodexSubagent(on: On) {
-  const runs = new Map<string, Run>()
+  // Prompts this module sent to a Codex agent: its first turn is known before the engine lists
+  // the agent or its transcript holds the mark.
+  const spawned = new Set<string>()
 
   // Turn the Agent call's model alias into a tier, and keep the subagent itself on haiku.
   on('agent.spawn', async ($, e, next) => {
@@ -90,46 +132,56 @@ export function registerCodexSubagent(on: On) {
           ? e.prompt.replace(/^\s*codex:/i, `codex: -t ${tier}`)
           : `codex: -t ${tier}\n${e.prompt}`
         : e.prompt
+    spawned.add(prompt.trim())
 
     return next({ ...e, prompt, model: 'haiku' })
   })
 
-  on('turn.start', async ($, e, next) => {
-    const started = await next(e)
-    if (!e.agentId) return started
-    const agent = (await $.agent.list()).find(a => a.id === e.agentId)
-    if (agent?.type !== AGENT) return started
-    const prior = runs.get(e.agentId)
-    if (prior) {
-      // A message that woke the agent again: a new Codex task carrying the first one as context.
-      prior.turns += 1
-      prior.task = `Earlier task, for context:\n${prior.task}\n\nNew message:\n${e.text}`
-    } else {
-      const { flags, body } = parseHeader(e.text)
-      runs.set(e.agentId, { flags, task: body, name: slug(agent.description || body), turns: 1, reported: null, answer: '' })
-    }
-
-    return started
-  })
-
   on('turn.step', async function* ($, e, next) {
-    const run = e.agentId ? runs.get(e.agentId) : undefined
-    if (!run) return yield* next(e)
+    if (!e.agentId) return yield* next(e)
+    const read = await $.session.messages({ agentId: e.agentId })
+    const messages = 'deny' in read ? [] : read
+    // A Codex agent by its type, or, once the engine stops listing it, by the mark in its transcript.
+    const agent = (await $.agent.list()).find(a => a.id === e.agentId)
+    const firstText = messages.find(isFromCaller)?.text.trim() ?? ''
+    const ours =
+      agent?.type === AGENT ||
+      spawned.has(firstText) ||
+      messages.some(m => m.role === 'assistant' && m.text.startsWith(MARK))
+    if (!ours) return yield* next(e)
 
-    // The step after the hand-back's tool result ends the turn with the answer as its last text.
+    const todo = plan(messages)
+    const finish = (answer: string) => ({
+      turnId: e.turnId,
+      index: e.index,
+      answer,
+      toolUses: [] as { name: string; input: unknown }[],
+      stopReason: 'end_turn' as const,
+      usage: null,
+    })
+
     // Sessions with SubagentHandback (the desktop app, auto mode) deliver the hand-back; the others
     // (headless `claude -p`, where that tool call fails) take an agent's last text as its result.
-    if (run.reported === e.turnId) {
-      yield { kind: 'text', index: 0, text: run.answer }
+    if (todo?.kind === 'end') {
+      yield { kind: 'text', index: 0, text: todo.answer }
       yield { kind: 'stop', stopReason: 'end_turn', usage: null }
-      return { turnId: e.turnId, index: e.index, answer: run.answer, toolUses: [], stopReason: 'end_turn', usage: null }
+      return finish(todo.answer)
+    }
+    // Never fall through to the placeholder model: say what is wrong as the agent's answer.
+    if (!todo) {
+      const why = 'deny' in read ? `its transcript could not be read (${read.deny})` : 'no new message to run'
+      const answer = `Codex agent did not run: ${why}. Send the task again as a new message.`
+      yield { kind: 'text', index: 0, text: answer }
+      yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+      return finish(answer)
     }
 
     const cwd = await $.session.cwd()
-    const argv = [wrapperPath($.plugin.root), 'run', '-v', '-n', run.name, '-C', cwd, ...run.flags, '-']
+    const name = slug(agent?.description || todo.first)
+    const argv = [wrapperPath($.plugin.root), 'run', '-v', '-n', name, '-C', cwd, ...todo.flags, '-']
 
     // Codex's steps stream as the agent's own text, so they stay in its view after it ends;
-    // only the SubagentHandback report reaches the caller.
+    // only the hand-back report reaches the caller.
     // No usage is reported: the engine books a step's usage under the subagent's Claude model
     // (haiku), which would count Codex's tokens as Claude usage. The steps show Codex's own count.
     let steps = ''
@@ -139,7 +191,7 @@ export function registerCodexSubagent(on: On) {
     const step = (line: string): string | null => {
       const head = line.match(/^▶ (\S+) · (.*)$/)
       // The view's own model label names the haiku placeholder; this line names the real model.
-      if (head) return `**Codex** · \`${head[1]}\` · ${head[2]}\n\n`
+      if (head) return `${MARK} \`${head[1]}\` · ${head[2]}\n\n`
       const text = line.trim()
       if (!text) return null
       if (text.startsWith('$ ')) return `- \`${text.replace(/`/g, "'")}\`\n`
@@ -147,7 +199,7 @@ export function registerCodexSubagent(on: On) {
     }
 
     try {
-      const child = $.process.spawn({ argv, input: run.task })
+      const child = $.process.spawn({ argv, input: todo.task })
       let pending = ''
       for await (const piece of child) {
         if (piece.stream === 'stdout') {
@@ -191,8 +243,6 @@ export function registerCodexSubagent(on: On) {
     // Hand the answer back the way a Claude subagent does: one SubagentHandback call.
     const input = { message: answer }
     const id = `toolu_codex_${crypto.randomUUID().replace(/-/g, '')}`
-    run.reported = e.turnId
-    run.answer = answer
     yield { kind: 'tool', index: 1, id, name: HANDBACK }
     yield { kind: 'input', index: 1, json: JSON.stringify(input) }
     yield { kind: 'stop', stopReason: 'tool_use', usage: null }

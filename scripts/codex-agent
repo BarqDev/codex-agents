@@ -3,7 +3,7 @@
 #
 #   codex-agent model [TIER]          print the auto-detected model for a tier (default: sol)
 #   codex-agent models                list all models (slug, priority, visibility)
-#   codex-agent limits                show the latest Codex weekly usage snapshot
+#   codex-agent limits [--fresh]      show Codex weekly usage (a ~10 s probe when no snapshot is under an hour old)
 #   codex-agent run [opts] "prompt"   run one task, print the final answer to stdout
 #   codex-agent watch [NAME]          live view of every running agent (run it in a terminal tab)
 #   codex-agent ps                    list recent runs with state and latest step
@@ -13,6 +13,8 @@
 #   -n NAME       label shown in watch/ps (default: first words of the prompt)
 #   -v            also print live progress to stderr
 #   -w            allow writes in the working dir (workspace-write sandbox); default read-only
+#   -N            -w plus network, e.g. test suites that need a local database or service
+#                 (Codex's sandbox cannot limit this to localhost: it is all network)
 #   -x            full access: no sandbox, network on (browser QA, deploy checks); use only when needed
 #   -C DIR        working directory for the task (default: current dir)
 #   -e EFFORT     low|medium|high|xhigh|max (default: medium; never "ultra", it self-delegates)
@@ -21,6 +23,9 @@
 #   -m MODEL      override the auto-detected model (wins over -t)
 #   -o FILE       also write the final answer to FILE
 #   -             read the prompt from stdin
+#
+# A run that may write (-w, -N, -x) in a git work tree ends its answer with `git status --short`,
+# so files a tool changed on the side (a lockfile after `uv add`) are not missed.
 #
 # Each run keeps meta.json, status.json, progress.log, events.jsonl and last.txt in
 # ~/.claude/cache/codex-runs/<id>/ (pruned after 7 days).
@@ -74,8 +79,19 @@ case "$cmd" in
   model) detect_model "${1:-}" ;;
   models) python3 -I "$MODELS" models "$CACHE" ;;
   limits)
-    f=$(find "$HOME/.codex/sessions" -name '*.jsonl' -mtime -2 -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null | while read -r p; do grep -q '"rate_limits"' "$p" && { echo "$p"; break; }; done)
-    [[ -n "$f" ]] || { echo "no recent Codex session with rate-limit data; run any non-ephemeral codex task first"; exit 0; }
+    f=""
+    if [[ "${1:-}" != --fresh ]]; then
+      f=$(find "$HOME/.codex/sessions" -name '*.jsonl' -mmin -60 -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null | while read -r p; do grep -q '"rate_limits"' "$p" && { echo "$p"; break; }; done)
+    fi
+    if [[ -z "$f" ]]; then
+      # No snapshot under an hour old: a tiny Luna call saves a session log that carries one.
+      bin=$(find_bin); ensure_catalog; probe_model=$(detect_model luna)
+      tid=$("$bin" exec -m "$probe_model" -c 'model_reasoning_effort="low"' -c "model_catalog_json=\"$CATALOG\"" \
+        --ignore-user-config --skip-git-repo-check -s read-only -C "$HOME" --json "Reply with exactly: OK" \
+        </dev/null 2>/dev/null | grep -o '"thread_id":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+      [[ -n "$tid" ]] && f=$(find "$HOME/.codex/sessions" -name "*$tid.jsonl" 2>/dev/null | head -1)
+    fi
+    [[ -n "$f" ]] || { echo "codex-agent: could not read Codex rate limits (the probe call failed; try: codex-agent doctor)" >&2; exit 1; }
     python3 -I "$MODELS" limits "$f"
     ;;
   doctor)
@@ -105,14 +121,17 @@ case "$cmd" in
   ps) exec python3 "$LIVE" ps ;;
   run)
     sandbox=read-only; dir="$PWD"; effort="${CODEX_AGENT_EFFORT:-medium}"; model=""; tier=""; out=""; name=""; echo_flag=""
-    while getopts "wxvC:e:m:t:o:n:" opt; do
+    network=""
+    while getopts "wxNvC:e:m:t:o:n:" opt; do
       case $opt in
-        w) sandbox=workspace-write ;; x) sandbox=full ;; v) echo_flag=--echo ;; C) dir="$OPTARG" ;;
+        w) sandbox=workspace-write ;; x) sandbox=full ;; N) network=1 ;; v) echo_flag=--echo ;; C) dir="$OPTARG" ;;
         e) effort="$OPTARG" ;; m) model="$OPTARG" ;; t) tier="$OPTARG" ;; o) out="$OPTARG" ;; n) name="$OPTARG" ;;
         *) exit 2 ;;
       esac
     done
     shift $((OPTIND - 1))
+    # -N is write access with network on; -x already has both.
+    if [[ -n "$network" && "$sandbox" != full ]]; then sandbox=workspace-write+network; fi
     [[ "$effort" == ultra ]] && effort=max
     prompt="${1:-}"; [[ -z "$prompt" || "$prompt" == "-" ]] && prompt="$(cat)"
     [[ -n "$name" ]] || name=$(printf '%s' "$prompt" | tr -cs 'A-Za-z0-9' ' ' | awk '{print tolower($1"-"$2"-"$3)}' | sed 's/-*$//')
@@ -124,7 +143,11 @@ case "$cmd" in
       "$name" "$model" "$effort" "$sandbox" "$dir" "$$" "$run/meta.json"
     printf '%s' "$prompt" >"$run/prompt.txt"
     echo '{"state":"running"}' >"$run/status.json"
-    if [[ "$sandbox" == full ]]; then access=(--dangerously-bypass-approvals-and-sandbox); else access=(-s "$sandbox"); fi
+    case "$sandbox" in
+      full) access=(--dangerously-bypass-approvals-and-sandbox) ;;
+      workspace-write+network) access=(-s workspace-write -c 'sandbox_workspace_write.network_access=true') ;;
+      *) access=(-s "$sandbox") ;;
+    esac
     # First live line names the run's settings; the codex-agents plugin reads the model from it.
     [[ -n "$echo_flag" ]] && echo "▶ $model · $effort · $sandbox" >&2
     set +e
@@ -140,8 +163,15 @@ case "$cmd" in
       tail -15 "$run/progress.log" "$run/stderr.log" >&2 2>/dev/null
       exit $rc
     fi
+    if [[ "$sandbox" != read-only ]] && git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      changes=$(git -C "$dir" status --short 2>/dev/null | head -60 || true)
+      if [[ -n "$changes" ]]; then
+        printf '\n\nWorking tree after this run (`git status --short`, including changes made before it):\n```\n%s\n```\n' \
+          "$changes" >>"$run/last.txt"
+      fi
+    fi
     [[ -n "$out" ]] && cp "$run/last.txt" "$out"
     cat "$run/last.txt"
     ;;
-  *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
