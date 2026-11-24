@@ -75,33 +75,85 @@ export async function registerCodexAgentType($: EngineInterface) {
   })
 }
 
+// What the engine inserts around a caller's words, kept out of tasks: system reminders, hand-back
+// nags, and the wrapper on a message sent while the agent was working.
+const COORDINATOR = /^\s*The coordinator sent a message while you were working:\s*([\s\S]*?)\s*(?:Address this before completing your current task\.?)?\s*$/
+export function clean(text: string): string {
+  const kept = text
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+    .split('\n')
+    .filter(line => !/^\s*\[handback-[a-z-]+\]/.test(line))
+    .join('\n')
+    .trim()
+  return kept.match(COORDINATOR)?.[1]?.trim() ?? kept
+}
+
+// The original task without any relayed message the engine merged into it: those are follow-ups,
+// counted on their own.
+const RELAYED = /The coordinator sent a message while you were working:[\s\S]*?(?:Address this before completing your current task\.?|$)/g
+const withoutRelayed = (text: string) => text.replace(RELAYED, '').trim()
+
+// The agent's transcript as the model would be sent it (`as: "api"`): unlike the row form, it holds
+// what the engine inserted, such as messages that arrived while a Codex run was going.
+type ApiMessage = { role: string; content: unknown }
+type Block = { type?: string; text?: string; name?: string; id?: string; input?: unknown; tool_use_id?: string; content?: unknown }
+export function fromApi(api: readonly ApiMessage[]): SessionMessage[] {
+  return api.map(m => {
+    const blocks: Block[] = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : ((m.content as Block[]) ?? [])
+    const text = blocks
+      .filter(b => b.type === 'text')
+      .map(b => b.text ?? '')
+      .join('\n')
+    const toolUses = blocks
+      .filter(b => b.type === 'tool_use')
+      .map(b => ({ tool_use_id: b.id ?? '', tool: b.name ?? '', input: (b.input ?? {}) as Record<string, unknown> }))
+    const toolResults = blocks
+      .filter(b => b.type === 'tool_result')
+      .map(b => ({ tool_use_id: b.tool_use_id ?? '', text: typeof b.content === 'string' ? b.content : '' }))
+    const role = m.role === 'assistant' ? 'assistant' : 'user'
+    return { role, text, toolUses, ...(toolResults.length ? { toolResults } : {}) } as SessionMessage
+  })
+}
+
 const isHandback = (m: SessionMessage) => m.role === 'assistant' && m.toolUses.some(t => t.tool === HANDBACK)
 const handbackText = (m: SessionMessage) =>
   String(m.toolUses.find(t => t.tool === HANDBACK)?.input?.message ?? '')
-// A message the caller sent (the task, or a SendMessage), not a tool result.
-const isFromCaller = (m: SessionMessage) => m.role === 'user' && !m.toolResults?.length && m.text.trim() !== ''
+// A message with words from the caller (the task, or a SendMessage), even beside a tool result.
+const isFromCaller = (m: SessionMessage) => m.role === 'user' && clean(m.text) !== ''
 
 // What this step has to do, read from the agent's own transcript so nothing lives in memory:
 // - `end`: the hand-back's result just came back; end the turn with the answer as its last text.
+// - `again`: nothing new since the last hand-back, but the engine wants one: hand the answer back again.
 // - `run`: run Codex on every message sent since the last answer (all of them on the first turn).
-type Plan = { kind: 'end'; answer: string } | { kind: 'run'; flags: string[]; task: string; first: string }
+type Plan =
+  | { kind: 'end'; answer: string }
+  | { kind: 'again'; answer: string }
+  | { kind: 'run'; flags: string[]; task: string; first: string; followUp: boolean }
 
-export function plan(messages: SessionMessage[]): Plan | null {
+// `queued` holds messages sent to the agent (caught at `session.send`) that its transcript does not
+// show yet: one sent while Codex ran reaches the transcript only as an engine-inserted message the
+// hook cannot read at step time.
+export function plan(messages: SessionMessage[], queued: readonly string[] = []): Plan | null {
   const callers = messages.filter(isFromCaller)
   const first = callers[0]
   if (!first) return null
-  const last = messages.at(-1)
   const lastHandback = [...messages].reverse().find(isHandback)
-  if (lastHandback && last?.role === 'user' && last.toolResults?.length && lastHandback === messages.at(-2))
+  // Since the last hand-back: only its tool result and what the engine inserted, no caller words.
+  const after = lastHandback ? messages.slice(messages.indexOf(lastHandback) + 1) : []
+  if (
+    lastHandback &&
+    queued.length === 0 &&
+    after.some(m => m.toolResults?.length) &&
+    after.every(m => m.role === 'user' && !isFromCaller(m))
+  )
     return { kind: 'end', answer: handbackText(lastHandback) }
 
-  const { flags, body } = parseHeader(first.text)
-  if (!lastHandback) return { kind: 'run', flags, task: body, first: body }
-  const fresh = messages
-    .slice(messages.indexOf(lastHandback) + 1)
-    .filter(isFromCaller)
-    .map(m => m.text.trim())
-  if (fresh.length === 0) return null
+  const { flags, body } = parseHeader(clean(withoutRelayed(first.text)))
+  if (!lastHandback) return { kind: 'run', flags, task: body, first: body, followUp: false }
+  const seen = after.filter(isFromCaller).map(m => clean(m.text))
+  // A queued message the transcript already shows counts once.
+  const fresh = [...seen, ...queued.map(t => t.trim()).filter(t => t && !seen.includes(t))]
+  if (fresh.length === 0) return { kind: 'again', answer: handbackText(lastHandback) }
   const task = [
     'You are continuing earlier work. The original task, for context:',
     body.trim(),
@@ -111,13 +163,24 @@ export function plan(messages: SessionMessage[]): Plan | null {
     fresh.map((t, i) => (fresh.length > 1 ? `${i + 1}. ${t}` : t)).join('\n\n'),
   ].join('\n\n')
 
-  return { kind: 'run', flags, task, first: body }
+  return { kind: 'run', flags, task, first: body, followUp: true }
 }
 
 export function registerCodexSubagent(on: On) {
   // Prompts this module sent to a Codex agent: its first turn is known before the engine lists
   // the agent or its transcript holds the mark.
   const spawned = new Set<string>()
+  // Messages sent to each Codex agent and not yet run, in the order they were sent.
+  const queued = new Map<string, string[]>()
+
+  // Catch every message sent to a Codex agent, so one sent while Codex runs is not lost.
+  on('session.send', async ($, e, next) => {
+    const agents = await $.agent.list().catch(() => [])
+    const agent = agents.find(a => a.type === AGENT && (a.id === e.to || a.id.startsWith(e.to) || e.to.startsWith(a.id)))
+    if (agent) queued.set(agent.id, [...(queued.get(agent.id) ?? []), e.text])
+
+    return next(e)
+  })
 
   // Turn the Agent call's model alias into a tier, and keep the subagent itself on haiku.
   on('agent.spawn', async ($, e, next) => {
@@ -139,18 +202,20 @@ export function registerCodexSubagent(on: On) {
 
   on('turn.step', async function* ($, e, next) {
     if (!e.agentId) return yield* next(e)
-    const read = await $.session.messages({ agentId: e.agentId })
-    const messages = 'deny' in read ? [] : read
+    const read = await $.session.messages({ agentId: e.agentId, as: 'api' })
+    const messages = 'deny' in read ? [] : fromApi(read as readonly ApiMessage[])
     // A Codex agent by its type, or, once the engine stops listing it, by the mark in its transcript.
     const agent = (await $.agent.list()).find(a => a.id === e.agentId)
-    const firstText = messages.find(isFromCaller)?.text.trim() ?? ''
+    const firstText = clean(messages.find(isFromCaller)?.text ?? '')
     const ours =
       agent?.type === AGENT ||
       spawned.has(firstText) ||
       messages.some(m => m.role === 'assistant' && m.text.startsWith(MARK))
     if (!ours) return yield* next(e)
 
-    const todo = plan(messages)
+    const todo = plan(messages, queued.get(e.agentId) ?? [])
+    // The queued messages are in this run's task now.
+    if (todo?.kind === 'run' && todo.followUp) queued.delete(e.agentId)
     const finish = (answer: string) => ({
       turnId: e.turnId,
       index: e.index,
@@ -167,13 +232,23 @@ export function registerCodexSubagent(on: On) {
       yield { kind: 'stop', stopReason: 'end_turn', usage: null }
       return finish(todo.answer)
     }
-    // Never fall through to the placeholder model: say what is wrong as the agent's answer.
-    if (!todo) {
-      const why = 'deny' in read ? `its transcript could not be read (${read.deny})` : 'no new message to run'
-      const answer = `Codex agent did not run: ${why}. Send the task again as a new message.`
-      yield { kind: 'text', index: 0, text: answer }
-      yield { kind: 'stop', stopReason: 'end_turn', usage: null }
-      return finish(answer)
+    // Hand an answer back as a SubagentHandback call: the engine counts a report as delivered only
+    // through it, and asks again otherwise.
+    const handBack = function* (answer: string) {
+      const input = { message: answer }
+      const id = `toolu_codex_${crypto.randomUUID().replace(/-/g, '')}`
+      yield { kind: 'tool' as const, index: 1, id, name: HANDBACK }
+      yield { kind: 'input' as const, index: 1, json: JSON.stringify(input) }
+      yield { kind: 'stop' as const, stopReason: 'tool_use' as const, usage: null }
+      return { name: HANDBACK, input }
+    }
+    // Never fall through to the placeholder model, and never answer without a hand-back.
+    if (!todo || todo.kind === 'again') {
+      const answer =
+        todo?.answer ||
+        `Codex agent did not run: ${'deny' in read ? `its transcript could not be read (${read.deny})` : 'it found no task'}. Send the task again as a new message.`
+      const use = yield* handBack(answer)
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [use], stopReason: 'tool_use', usage: null }
     }
 
     const cwd = await $.session.cwd()
@@ -241,12 +316,8 @@ export function registerCodexSubagent(on: On) {
     }
 
     // Hand the answer back the way a Claude subagent does: one SubagentHandback call.
-    const input = { message: answer }
-    const id = `toolu_codex_${crypto.randomUUID().replace(/-/g, '')}`
-    yield { kind: 'tool', index: 1, id, name: HANDBACK }
-    yield { kind: 'input', index: 1, json: JSON.stringify(input) }
-    yield { kind: 'stop', stopReason: 'tool_use', usage: null }
+    const use = yield* handBack(answer)
 
-    return { turnId: e.turnId, index: e.index, answer: steps, toolUses: [{ name: HANDBACK, input }], stopReason: 'tool_use', usage: null }
+    return { turnId: e.turnId, index: e.index, answer: steps, toolUses: [use], stopReason: 'tool_use', usage: null }
   })
 }
