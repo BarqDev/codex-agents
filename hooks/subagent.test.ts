@@ -133,3 +133,8 @@ test('the -U flag is kept for the wrapper', async () => {
   const p = plan([user('codex: -U -w -t terra\nMake a one-page summary.docx')] as never)
   expect(p?.kind === 'run' && p.flags).toEqual(['-U', '-w', '-t', 'terra'])
 })
+
+test('the -B flag is kept for the wrapper', async () => {
+  const p = plan([user('codex: -B\nOpen my Shopify admin and read the order count')] as never)
+  expect(p?.kind === 'run' && p.flags).toEqual(['-B'])
+})

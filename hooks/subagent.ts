@@ -15,7 +15,8 @@ const DESCRIPTION = [
   '-t sol|terra|luna (model tier; default sol, terra when the Agent call passes model "sonnet", luna for "haiku"),',
   '-w (may edit files in the working directory), -N (with -w: network on, e.g. a local database for tests),',
   "-x (full access with network: browser QA, deploy checks), -U (load the user's Codex config: its document skills for Word, Excel, PowerPoint and PDF files),",
-  "-e low|medium|high (effort), -C <dir> (working directory). It cannot drive the user's Chrome: that stays with Claude.",
+  "-e low|medium|high (effort), -C <dir> (working directory),",
+  "-B (run inside the ChatGPT app, whose Codex can drive the user's own Chrome with its logins: for tasks on logged-in sites; needs the app open, uses the app's model, runs one task per \"Claude bridge\" thread the user created in the app).",
   'SendMessage to it after it finished starts a new Codex run with every message sent since its last answer.',
 ].join(' ')
 
@@ -30,7 +31,7 @@ const HANDBACK = 'SubagentHandback'
 const MARK = '**Codex** ·'
 
 const FLAG_WITH_VALUE = new Set(['-t', '-e', '-C', '-n'])
-const FLAG_ALONE = new Set(['-w', '-x', '-N', '-U'])
+const FLAG_ALONE = new Set(['-w', '-x', '-N', '-U', '-B'])
 
 function parseHeader(prompt: string): { flags: string[]; body: string } {
   const m = prompt.match(/^\s*codex:([^\n]*)\n?/i)

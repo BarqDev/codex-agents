@@ -16,6 +16,10 @@
 #   -N            -w plus network, e.g. test suites that need a local database or service
 #                 (Codex's sandbox cannot limit this to localhost: it is all network)
 #   -x            full access: no sandbox, network on (browser QA, deploy checks); use only when needed
+#   -B            run in the ChatGPT app's own Codex, which can drive your Chrome (logged-in pages):
+#                 the task goes to a free "Claude bridge" thread you created in the app (create
+#                 "Claude bridge 2", "3" ... to run several at once). Needs the app open. The app's
+#                 model and settings apply, so -t, -e, -w, -N, -x, -U and -C have no effect.
 #   -U            load your Codex config (~/.codex/config.toml): the plugins, MCP servers and settings
 #                 you enabled in Codex (GitHub, Figma, documents, ...). Off by default, which starts
 #                 faster. Driving your Chrome still needs the ChatGPT app itself.
@@ -42,6 +46,7 @@ LIVE="$(dirname "$0")/codex-agent-live.py"
 # Python lives in files, never heredocs: bash writes a heredoc to a temp file, which a read-only
 # sandbox refuses. -I keeps it from reading or writing anything beside the script.
 MODELS="$(dirname "$0")/codex-agent-models.py"
+BRIDGE="$(dirname "$0")/codex-agent-bridge.py"
 
 find_bin() {
   if [[ -n "${CODEX_BIN:-}" ]]; then
@@ -124,10 +129,10 @@ case "$cmd" in
   ps) exec python3 "$LIVE" ps ;;
   run)
     sandbox=read-only; dir="$PWD"; effort="${CODEX_AGENT_EFFORT:-medium}"; model=""; tier=""; out=""; name=""; echo_flag=""
-    network=""; userconf=""
-    while getopts "wxNUvC:e:m:t:o:n:" opt; do
+    network=""; userconf=""; bridge=""
+    while getopts "wxNUBvC:e:m:t:o:n:" opt; do
       case $opt in
-        w) sandbox=workspace-write ;; x) sandbox=full ;; N) network=1 ;; U) userconf=1 ;; v) echo_flag=--echo ;; C) dir="$OPTARG" ;;
+        w) sandbox=workspace-write ;; x) sandbox=full ;; N) network=1 ;; U) userconf=1 ;; B) bridge=1 ;; v) echo_flag=--echo ;; C) dir="$OPTARG" ;;
         e) effort="$OPTARG" ;; m) model="$OPTARG" ;; t) tier="$OPTARG" ;; o) out="$OPTARG" ;; n) name="$OPTARG" ;;
         *) exit 2 ;;
       esac
@@ -138,7 +143,14 @@ case "$cmd" in
     [[ "$effort" == ultra ]] && effort=max
     prompt="${1:-}"; [[ -z "$prompt" || "$prompt" == "-" ]] && prompt="$(cat)"
     [[ -n "$name" ]] || name=$(printf '%s' "$prompt" | tr -cs 'A-Za-z0-9' ' ' | awk '{print tolower($1"-"$2"-"$3)}' | sed 's/-*$//')
-    bin=$(find_bin); [[ -n "$model" ]] || model=$(detect_model "$tier"); ensure_catalog
+    bin=$(find_bin)
+    if [[ -n "$bridge" ]]; then
+      # The task runs inside the ChatGPT app (see codex-agent-bridge.py); it records its own run.
+      printf '%s' "$prompt" | python3 -I "$BRIDGE" run --bin "$bin" --runs "$RUNS" --name "$name" \
+        ${echo_flag:+--echo} ${out:+--out "$out"}
+      exit $?
+    fi
+    [[ -n "$model" ]] || model=$(detect_model "$tier"); ensure_catalog
     mkdir -p "$RUNS"; find "$RUNS" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
     run="$RUNS/$(date +%Y%m%d-%H%M%S)-$$-${name//[^A-Za-z0-9_-]/}"
     mkdir -p "$run"
