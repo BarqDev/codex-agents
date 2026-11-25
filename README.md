@@ -75,3 +75,12 @@ Ask Claude to delegate ("have Codex agents check X and Y in parallel"), or let i
 - Codex's commands show as lines of text in the agent's view, not as separate tool-call rows.
 - A follow-up starts a fresh Codex run: Codex gets the earlier task and answer as text, not its earlier working state.
 - The usage limit that matters is your weekly Codex allowance. `codex-agent limits` shows it; when its last reading is over an hour old it makes a tiny probe call (about 10 seconds) to get a fresh one.
+
+## Changes
+
+- **0.5.0** (2026-11-25): `-B` runs browser tasks in the ChatGPT app's Codex, which can drive your own Chrome, through "Claude bridge" threads you create in the app (one task per thread at a time).
+- **0.4.3** (2026-11-25): `-U` loads your own Codex config, adding its document skills for Word, Excel, PowerPoint and PDF files.
+- **0.4.2** (2026-11-24): Messages sent to a Codex agent while it runs are now carried out, in order, once its current run finishes.
+- **0.4.1** (2026-11-22): The quota stop point is raised from 85% to 98% of weekly Codex usage.
+- **0.4.0** (2026-11-22): Follow-ups to finished agents start a new run; reports always reach the caller; `-N` adds network to `-w`; `limits` probes when its reading is stale; reports end with `git status`; the status line shows running agents.
+- **0.3.0** (2026-11-21): First shared release: the `codex` subagent type, the Codex agents panel, built-in guidance and `/codex-setup`.
