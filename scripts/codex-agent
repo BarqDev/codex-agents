@@ -16,6 +16,9 @@
 #   -N            -w plus network, e.g. test suites that need a local database or service
 #                 (Codex's sandbox cannot limit this to localhost: it is all network)
 #   -x            full access: no sandbox, network on (browser QA, deploy checks); use only when needed
+#   -U            load your Codex config (~/.codex/config.toml): the plugins, MCP servers and settings
+#                 you enabled in Codex (GitHub, Figma, documents, ...). Off by default, which starts
+#                 faster. Driving your Chrome still needs the ChatGPT app itself.
 #   -C DIR        working directory for the task (default: current dir)
 #   -e EFFORT     low|medium|high|xhigh|max (default: medium; never "ultra", it self-delegates)
 #   -t TIER       sol (default, top non-Astra workhorse), terra (mid tier, like Sonnet), luna (fast/cheap);
@@ -121,10 +124,10 @@ case "$cmd" in
   ps) exec python3 "$LIVE" ps ;;
   run)
     sandbox=read-only; dir="$PWD"; effort="${CODEX_AGENT_EFFORT:-medium}"; model=""; tier=""; out=""; name=""; echo_flag=""
-    network=""
-    while getopts "wxNvC:e:m:t:o:n:" opt; do
+    network=""; userconf=""
+    while getopts "wxNUvC:e:m:t:o:n:" opt; do
       case $opt in
-        w) sandbox=workspace-write ;; x) sandbox=full ;; N) network=1 ;; v) echo_flag=--echo ;; C) dir="$OPTARG" ;;
+        w) sandbox=workspace-write ;; x) sandbox=full ;; N) network=1 ;; U) userconf=1 ;; v) echo_flag=--echo ;; C) dir="$OPTARG" ;;
         e) effort="$OPTARG" ;; m) model="$OPTARG" ;; t) tier="$OPTARG" ;; o) out="$OPTARG" ;; n) name="$OPTARG" ;;
         *) exit 2 ;;
       esac
@@ -148,11 +151,14 @@ case "$cmd" in
       workspace-write+network) access=(-s workspace-write -c 'sandbox_workspace_write.network_access=true') ;;
       *) access=(-s "$sandbox") ;;
     esac
+    # -U keeps the user's Codex config (plugins, MCP servers) but not its turn-end notify hook,
+    # which belongs to the Codex app; -m and -c above still decide the model and effort.
+    if [[ -n "$userconf" ]]; then config=(-c 'notify=[]'); else config=(--ignore-user-config); fi
     # First live line names the run's settings; the codex-agents plugin reads the model from it.
-    [[ -n "$echo_flag" ]] && echo "▶ $model · $effort · $sandbox" >&2
+    [[ -n "$echo_flag" ]] && echo "▶ $model · $effort · $sandbox${userconf:+ · your Codex config}" >&2
     set +e
     "$bin" exec -m "$model" -c "model_reasoning_effort=\"$effort\"" -c "model_catalog_json=\"$CATALOG\"" \
-      --ignore-user-config --skip-git-repo-check --ephemeral "${access[@]}" -C "$dir" --json \
+      "${config[@]}" --skip-git-repo-check --ephemeral "${access[@]}" -C "$dir" --json \
       -o "$run/last.txt" "$prompt" </dev/null 2>"$run/stderr.log" | tee "$run/events.jsonl" | python3 "$LIVE" fmt "$run" $echo_flag
     rc=${PIPESTATUS[0]}
     set -e

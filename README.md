@@ -57,6 +57,9 @@ Ask Claude to delegate ("have Codex agents check X and Y in parallel"), or let i
   - `-w` lets it edit files in the working directory, with no network (not even localhost).
   - `-N` is `-w` plus network. Use it for test suites that need a local database or service. Codex's sandbox can't limit this to localhost, so it is full network.
   - `-x` gives full access with network, for browser QA and the like.
+  - `-U` loads your own Codex config (`~/.codex/config.toml`): the plugins and tools you enabled in Codex. In practice that adds the document skills (Word, Excel, PowerPoint, PDF files) and the runtime they use; pair it with `-w` so the files can be written. Without it a run starts from a clean config.
+- **Connected apps:** your ChatGPT account's connected apps (Figma, Google Drive, Slack and so on) are available to every Codex agent, with or without `-U`.
+- **Your Chrome:** Codex agents can't drive your own Chrome, even with `-U`. The ChatGPT app gives only its own Codex access to the "ChatGPT for Chrome" extension, so keep logged-in browser work with Claude. For testing your own app, `-x` lets Codex run Playwright in a separate headless browser.
 - **Changed files:** a run that may write ends its report with the working tree's `git status --short`, so lockfiles and generated files show up even when the report forgets them.
 - **Follow-ups:** SendMessage to a finished Codex agent starts one new Codex run with every message sent since its last answer, in order, plus the earlier task and answer as context.
 - **Seeing progress:** the subagent view streams each agent's steps; the Codex agents panel lists every run; the status line shows how many Codex agents are running and the latest step of the longest one.

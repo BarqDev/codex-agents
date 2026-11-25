@@ -128,3 +128,8 @@ test('a relayed message merged into the first message stays out of the original 
   expect(p.task).not.toContain('coordinator')
   expect(p.task).toContain('New message:\n\nFollow-up 1: count lines.')
 })
+
+test('the -U flag is kept for the wrapper', async () => {
+  const p = plan([user('codex: -U -w -t terra\nMake a one-page summary.docx')] as never)
+  expect(p?.kind === 'run' && p.flags).toEqual(['-U', '-w', '-t', 'terra'])
+})
